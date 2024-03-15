@@ -56,19 +56,39 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
 
     pub(super) fn handle_sync_timestamp(&mut self, id: u16, timestamp: Time) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
-            let packet_length = match self
-                .instance_state
-                .with_ref(|state| {
-                    Message::follow_up(
-                        &state.default_ds,
-                        self.port_identity,
-                        id,
-                        timestamp,
-                        self.config.minor_ptp_version.into(),
-                    )
+            let mut follow_up = self.instance_state.with_ref(|state| {
+                Message::follow_up(
+                    &state.default_ds,
+                    self.port_identity,
+                    id,
+                    timestamp,
+                    self.config.minor_ptp_version.into(),
+                )
+            });
+
+            // TODO: gPTP Follow_Up TLV
+            let mut tlv_buffer = [0; 32];
+            let mut tlv_builder = TlvSetBuilder::new(&mut tlv_buffer);
+            tlv_builder
+                .add(Tlv {
+                    tlv_type: TlvType::OrganizationExtension,
+                    value: [
+                        0x00, 0x80, 0xc2, // organizationId
+                        0x00, 0x00, 0x01, // organizationSubType
+                        0x00, 0x00, 0x00, 0x00, // cumulativeScaledRateOffset
+                        0x00, 0x00, // gmTimeBaseIndicator
+                        0x00, 0x00, 0x00, 0x00, // lastGmPhaseChange
+                        0x00, 0x00, 0x00, 0x00, // ...
+                        0x00, 0x00, 0x00, 0x00, // ...
+                        0x00, 0x00, 0x00, 0x00, // scaledLastGmFreqChange
+                    ]
+                    .as_slice()
+                    .into(),
                 })
-                .serialize(&mut self.packet_buffer)
-            {
+                .unwrap();
+            follow_up.suffix = tlv_builder.build();
+
+            let packet_length = match follow_up.serialize(&mut self.packet_buffer) {
                 Ok(length) => length,
                 Err(error) => {
                     log::error!(

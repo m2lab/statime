@@ -24,8 +24,9 @@ use statime_linux::{
     initialize_logging_parse_config,
     observer::ObservableInstanceState,
     socket::{
-        open_ethernet_socket, open_ipv4_event_socket, open_ipv4_general_socket,
-        open_ipv6_event_socket, open_ipv6_general_socket, PtpTargetAddress,
+        open_ethernet_socket, open_gptp_socket, open_ipv4_event_socket, open_ipv4_general_socket,
+        open_ipv6_event_socket, open_ipv6_general_socket, GptpEthernetAddresses,
+        Ieee1588EthernetAddresses, PtpTargetAddress,
     },
     tlvforwarder::TlvForwarder,
 };
@@ -417,7 +418,23 @@ async fn actual_main() {
                 let socket = open_ethernet_socket(interface, timestamping, bind_phc)
                     .expect("Could not open socket");
 
-                tokio::spawn(ethernet_port_task(
+                tokio::spawn(ethernet_port_task::<Ieee1588EthernetAddresses>(
+                    port_task_receiver,
+                    port_task_sender,
+                    interface
+                        .get_index()
+                        .expect("Unable to get network interface index") as _,
+                    socket,
+                    bmca_notify_receiver.clone(),
+                    tlv_forwarder.duplicate(),
+                    port_clock,
+                ));
+            }
+            statime_linux::config::NetworkMode::Gptp => {
+                let socket = open_gptp_socket(interface, timestamping, bind_phc)
+                    .expect("Could not open socket");
+
+                tokio::spawn(ethernet_port_task::<GptpEthernetAddresses>(
                     port_task_receiver,
                     port_task_sender,
                     interface
@@ -550,7 +567,7 @@ type BmcaPort = Port<
 // It will then move the port into the running state, and process actions. When
 // the task is notified of a BMCA, it will stop running, move the port into the
 // bmca state, and send it on its Sender
-async fn port_task<A: NetworkAddress + PtpTargetAddress>(
+async fn port_task<A: NetworkAddress + PtpTargetAddress<AddressType = A>>(
     mut port_task_receiver: Receiver<BmcaPort>,
     port_task_sender: Sender<BmcaPort>,
     mut event_socket: Socket<A, Open>,
@@ -573,7 +590,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
         // handle post-bmca actions
         let (mut port, actions) = port_in_bmca.end_bmca();
 
-        let mut pending_timestamp = handle_actions(
+        let mut pending_timestamp = handle_actions::<A>(
             actions,
             &mut event_socket,
             &mut general_socket,
@@ -584,7 +601,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
         .await;
 
         while let Some((context, timestamp)) = pending_timestamp {
-            pending_timestamp = handle_actions(
+            pending_timestamp = handle_actions::<A>(
                 port.handle_send_timestamp(context, timestamp),
                 &mut event_socket,
                 &mut general_socket,
@@ -641,7 +658,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
             };
 
             loop {
-                let pending_timestamp = handle_actions(
+                let pending_timestamp = handle_actions::<A>(
                     actions,
                     &mut event_socket,
                     &mut general_socket,
@@ -670,7 +687,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
 // It will then move the port into the running state, and process actions. When
 // the task is notified of a BMCA, it will stop running, move the port into the
 // bmca state, and send it on its Sender
-async fn ethernet_port_task(
+async fn ethernet_port_task<A: PtpTargetAddress<AddressType = EthernetAddress>>(
     mut port_task_receiver: Receiver<BmcaPort>,
     port_task_sender: Sender<BmcaPort>,
     interface: libc::c_int,
@@ -699,7 +716,7 @@ async fn ethernet_port_task(
         // handle post-bmca actions
         let (mut port, actions) = port_in_bmca.end_bmca();
 
-        let mut pending_timestamp = handle_actions_ethernet(
+        let mut pending_timestamp = handle_actions_ethernet::<A>(
             actions,
             interface,
             &mut socket,
@@ -710,7 +727,7 @@ async fn ethernet_port_task(
         .await;
 
         while let Some((context, timestamp)) = pending_timestamp {
-            pending_timestamp = handle_actions_ethernet(
+            pending_timestamp = handle_actions_ethernet::<A>(
                 port.handle_send_timestamp(context, timestamp),
                 interface,
                 &mut socket,
@@ -758,7 +775,7 @@ async fn ethernet_port_task(
             };
 
             loop {
-                let pending_timestamp = handle_actions_ethernet(
+                let pending_timestamp = handle_actions_ethernet::<A>(
                     actions,
                     interface,
                     &mut socket,
@@ -789,14 +806,18 @@ struct Timers<'a> {
     filter_update_timer: Pin<&'a mut Timer>,
 }
 
-async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
+async fn handle_actions<A>(
     actions: PortActionIterator<'_>,
-    event_socket: &mut Socket<A, Open>,
-    general_socket: &mut Socket<A, Open>,
+    event_socket: &mut Socket<A::AddressType, Open>,
+    general_socket: &mut Socket<A::AddressType, Open>,
     timers: &mut Timers<'_>,
     tlv_forwarder: &TlvForwarder,
     clock: &BoxedClock,
-) -> Option<(TimestampContext, Time)> {
+) -> Option<(TimestampContext, Time)>
+where
+    A: PtpTargetAddress,
+    A::AddressType: NetworkAddress,
+{
     let mut pending_timestamp = None;
 
     for action in actions {
@@ -864,7 +885,7 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
     pending_timestamp
 }
 
-async fn handle_actions_ethernet(
+async fn handle_actions_ethernet<A: PtpTargetAddress<AddressType = EthernetAddress>>(
     actions: PortActionIterator<'_>,
     interface: libc::c_int,
     socket: &mut Socket<EthernetAddress, Open>,
@@ -887,14 +908,14 @@ async fn handle_actions_ethernet(
                         data,
                         EthernetAddress::new(
                             if link_local {
-                                EthernetAddress::PDELAY_EVENT.protocol()
+                                A::PDELAY_EVENT.protocol()
                             } else {
-                                EthernetAddress::PRIMARY_EVENT.protocol()
+                                A::PRIMARY_EVENT.protocol()
                             },
                             if link_local {
-                                EthernetAddress::PDELAY_EVENT.mac()
+                                A::PDELAY_EVENT.mac()
                             } else {
-                                EthernetAddress::PRIMARY_EVENT.mac()
+                                A::PRIMARY_EVENT.mac()
                             },
                             interface,
                         ),
@@ -916,14 +937,14 @@ async fn handle_actions_ethernet(
                         data,
                         EthernetAddress::new(
                             if link_local {
-                                EthernetAddress::PDELAY_GENERAL.protocol()
+                                A::PDELAY_GENERAL.protocol()
                             } else {
-                                EthernetAddress::PRIMARY_GENERAL.protocol()
+                                A::PRIMARY_GENERAL.protocol()
                             },
                             if link_local {
-                                EthernetAddress::PDELAY_GENERAL.mac()
+                                A::PDELAY_GENERAL.mac()
                             } else {
-                                EthernetAddress::PRIMARY_GENERAL.mac()
+                                A::PRIMARY_GENERAL.mac()
                             },
                             interface,
                         ),
