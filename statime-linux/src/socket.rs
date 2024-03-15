@@ -26,13 +26,17 @@ const GENERAL_PORT: u16 = 320;
 const PTP_ETHERTYPE: u16 = 0x88f7;
 
 pub trait PtpTargetAddress {
-    const PRIMARY_EVENT: Self;
-    const PRIMARY_GENERAL: Self;
-    const PDELAY_EVENT: Self;
-    const PDELAY_GENERAL: Self;
+    type AddressType;
+
+    const PRIMARY_EVENT: Self::AddressType;
+    const PRIMARY_GENERAL: Self::AddressType;
+    const PDELAY_EVENT: Self::AddressType;
+    const PDELAY_GENERAL: Self::AddressType;
 }
 
 impl PtpTargetAddress for SocketAddrV4 {
+    type AddressType = Self;
+
     const PRIMARY_EVENT: Self = SocketAddrV4::new(IPV4_PRIMARY_MULTICAST, EVENT_PORT);
     const PRIMARY_GENERAL: Self = SocketAddrV4::new(IPV4_PRIMARY_MULTICAST, GENERAL_PORT);
     const PDELAY_EVENT: Self = SocketAddrV4::new(IPV4_PDELAY_MULTICAST, EVENT_PORT);
@@ -40,25 +44,47 @@ impl PtpTargetAddress for SocketAddrV4 {
 }
 
 impl PtpTargetAddress for SocketAddrV6 {
+    type AddressType = Self;
+
     const PRIMARY_EVENT: Self = SocketAddrV6::new(IPV6_PRIMARY_MULTICAST, EVENT_PORT, 0, 0);
     const PRIMARY_GENERAL: Self = SocketAddrV6::new(IPV6_PRIMARY_MULTICAST, GENERAL_PORT, 0, 0);
     const PDELAY_EVENT: Self = SocketAddrV6::new(IPV6_PDELAY_MULTICAST, EVENT_PORT, 0, 0);
     const PDELAY_GENERAL: Self = SocketAddrV6::new(IPV6_PDELAY_MULTICAST, GENERAL_PORT, 0, 0);
 }
 
-impl PtpTargetAddress for EthernetAddress {
-    const PRIMARY_EVENT: Self = EthernetAddress::new(
+pub struct Ieee1588EthernetAddresses;
+// TODO: Nameing. Could also be some variation of
+// Ieee802dot1asEthenernetAddresses
+pub struct GptpEthernetAddresses;
+
+impl PtpTargetAddress for Ieee1588EthernetAddresses {
+    type AddressType = EthernetAddress;
+
+    const PRIMARY_EVENT: EthernetAddress = EthernetAddress::new(
         PTP_ETHERTYPE,
         MacAddress::new([0x01, 0x1b, 0x19, 0x00, 0x00, 0x00]),
         0,
     );
-    const PRIMARY_GENERAL: Self = Self::PRIMARY_EVENT;
-    const PDELAY_EVENT: Self = EthernetAddress::new(
+    const PRIMARY_GENERAL: EthernetAddress = Self::PRIMARY_EVENT;
+    const PDELAY_EVENT: EthernetAddress = EthernetAddress::new(
         PTP_ETHERTYPE,
         MacAddress::new([0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e]),
         0,
     );
-    const PDELAY_GENERAL: Self = Self::PDELAY_EVENT;
+    const PDELAY_GENERAL: EthernetAddress = Self::PDELAY_EVENT;
+}
+
+impl PtpTargetAddress for GptpEthernetAddresses {
+    type AddressType = EthernetAddress;
+
+    const PRIMARY_EVENT: EthernetAddress = EthernetAddress::new(
+        PTP_ETHERTYPE,
+        MacAddress::new([0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e]),
+        0,
+    );
+    const PRIMARY_GENERAL: EthernetAddress = Self::PRIMARY_EVENT;
+    const PDELAY_EVENT: EthernetAddress = Self::PRIMARY_EVENT;
+    const PDELAY_GENERAL: EthernetAddress = Self::PRIMARY_EVENT;
 }
 
 pub fn open_ipv4_event_socket(
@@ -111,8 +137,17 @@ pub fn open_ethernet_socket(
     timestamping: InterfaceTimestampMode,
 ) -> std::io::Result<Socket<EthernetAddress, Open>> {
     let socket = open_interface_ethernet(interface, PTP_ETHERTYPE, timestamping)?;
-    socket.join_multicast(EthernetAddress::PRIMARY_EVENT, interface)?;
-    socket.join_multicast(EthernetAddress::PDELAY_EVENT, interface)?;
+    socket.join_multicast(Ieee1588EthernetAddresses::PRIMARY_EVENT, interface)?;
+    socket.join_multicast(Ieee1588EthernetAddresses::PDELAY_EVENT, interface)?;
+    Ok(socket)
+}
+
+pub fn open_gptp_socket(
+    interface: InterfaceName,
+    timestamping: InterfaceTimestampMode,
+) -> std::io::Result<Socket<EthernetAddress, Open>> {
+    let socket = open_interface_ethernet(interface, PTP_ETHERTYPE, timestamping)?;
+    socket.join_multicast(GptpEthernetAddresses::PRIMARY_EVENT, interface)?;
     Ok(socket)
 }
 

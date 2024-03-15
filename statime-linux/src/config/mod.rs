@@ -137,6 +137,7 @@ pub enum NetworkMode {
     Ipv4,
     Ipv6,
     Ethernet,
+    Gptp,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]

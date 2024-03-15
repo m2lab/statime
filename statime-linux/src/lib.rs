@@ -38,6 +38,7 @@ pub fn setup_logger(level: log::LevelFilter) -> Result<(), fern::InitError> {
             ))
         })
         .level(level)
+        .level_for("statime::filters", log::LevelFilter::Warn)
         .chain(std::io::stdout())
         .apply()?;
     Ok(())

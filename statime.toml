@@ -1,12 +1,21 @@
 loglevel = "info" # Other values include trace, debug, warn and error
 
 # which ptp network to participate in?
-sdo-id = 0
+sdo-id = 0x100
 domain = 0
 
+priority1 = 240
+priority2 = 248
+
+path-trace = true
+
 # Add one of these per network interface in your system
-#[[port]]
-#interface = "<interfacename>"
-#network-mode = "ipv4" #can also be ipv6 or ethernet
+[[port]]
+interface = "enp0s25"
+network-mode = "gptp" #can also be ipv4, ipv6 or ethernet
 # If the network interface has hardware clock support, you can enable it with
-#hardware-clock = "/dev/ptp<hardware clock number>"
+hardware-clock = "/dev/ptp0"
+announce-interval = 0
+sync-interval = -3
+delay-mechanism = "P2P"
+delay-interval = 0
