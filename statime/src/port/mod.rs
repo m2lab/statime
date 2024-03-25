@@ -729,6 +729,7 @@ mod tests {
             domain_number: 0,
             slave_only: false,
             sdo_id: Default::default(),
+            path_trace: false,
         });
 
         let parent_ds = InternalParentDS::new(default_ds);

@@ -5,7 +5,8 @@ use crate::{
     bmc::bmca::{BestAnnounceMessage, RecommendedState},
     config::{AcceptableMasterList, LeapIndicator, TimePropertiesDS, TimeSource},
     datastructures::{
-        datasets::{InternalCurrentDS, InternalDefaultDS, InternalParentDS},
+        common::{ClockIdentity, TlvType},
+        datasets::{InternalCurrentDS, InternalDefaultDS, InternalParentDS, InternalPathTraceDS},
         messages::Message,
     },
     filters::Filter,
@@ -33,7 +34,7 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
                     .instance_state
                     .with_ref(|s| s.parent_ds.parent_port_identity)
         {
-            self.instance_state.with_mut(|state| {
+            let clock_loop_detected = self.instance_state.with_mut(|state| {
                 let current_ds = &mut state.current_ds;
                 let parent_ds = &mut state.parent_ds;
                 let time_properties_ds = &mut state.time_properties_ds;
@@ -47,7 +48,34 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
                 parent_ds.grandmaster_priority_2 = announce.grandmaster_priority_2;
 
                 *time_properties_ds = announce.time_properties();
+
+                let path_trace_ds = &mut state.path_trace_ds;
+                if path_trace_ds.enable {
+                    if let Some(tlv) = message
+                        .suffix
+                        .tlv()
+                        .find(|tlv| tlv.tlv_type == TlvType::PathTrace)
+                    {
+                        let clock_identity = state.default_ds.clock_identity;
+                        if tlv.value.chunks_exact(8).any(|ci| ci == clock_identity.0) {
+                            log::warn!("Clock loop detected");
+                            return true;
+                        }
+
+                        path_trace_ds.list = tlv
+                            .value
+                            .chunks_exact(8)
+                            .map(|ci| ClockIdentity(<[u8; 8]>::try_from(ci).unwrap()))
+                            .collect();
+                    }
+                }
+
+                false
             });
+
+            if clock_loop_detected {
+                return actions![];
+            }
         }
 
         if self
@@ -101,6 +129,7 @@ impl<'a, A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBm
     pub(crate) fn set_recommended_state(
         &mut self,
         recommended_state: RecommendedState,
+        path_trace_ds: &mut InternalPathTraceDS,
         time_properties_ds: &mut TimePropertiesDS,
         current_ds: &mut InternalCurrentDS,
         parent_ds: &mut InternalParentDS,
@@ -129,6 +158,8 @@ impl<'a, A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBm
                 time_properties_ds.time_traceable = false;
                 time_properties_ds.frequency_traceable = false;
                 time_properties_ds.time_source = TimeSource::InternalOscillator;
+
+                path_trace_ds.list.clear();
             }
             RecommendedState::M3(_) | RecommendedState::P1(_) | RecommendedState::P2(_) => {}
             RecommendedState::S1(announce_message) => {

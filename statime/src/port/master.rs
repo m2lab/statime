@@ -1,7 +1,9 @@
+use arrayvec::ArrayVec;
+
 use super::{state::PortState, ForwardedTLVProvider, Port, PortActionIterator, Running};
 use crate::{
     datastructures::{
-        common::{PortIdentity, TlvSetBuilder},
+        common::{PortIdentity, Tlv, TlvSetBuilder, TlvType},
         messages::{DelayReqMessage, Header, Message, MAX_DATA_LEN},
     },
     filters::Filter,
@@ -88,6 +90,36 @@ impl<'a, A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'a, Running, A, R, C
             });
             let mut tlv_margin = MAX_DATA_LEN - message.wire_size();
 
+            let path_trace_enabled = self.instance_state.with_ref(|state| {
+                let default_ds = &state.default_ds;
+                let path_trace_ds = &state.path_trace_ds;
+                if path_trace_ds.enable {
+                    'path_trace: {
+                        let mut path = path_trace_ds.list.clone();
+                        if path.try_push(default_ds.clock_identity).is_err() {
+                            break 'path_trace;
+                        }
+
+                        let value = ArrayVec::<_, MAX_DATA_LEN>::from_iter(
+                            path.into_iter().flat_map(|ci| ci.0),
+                        );
+                        let tlv = Tlv {
+                            tlv_type: TlvType::PathTrace,
+                            value: value.as_slice().into(),
+                        };
+
+                        let tlv_size = tlv.wire_size();
+                        if tlv_margin > tlv_size {
+                            tlv_margin -= tlv_size;
+                            // Will not fail as previous checks ensure sufficient space in buffer.
+                            tlv_builder.add(tlv).unwrap();
+                        }
+                    }
+                }
+
+                path_trace_ds.enable
+            });
+
             while let Some(tlv) = tlv_provider.next_if_smaller(tlv_margin) {
                 assert!(tlv.size() < tlv_margin);
                 let parent_port_identity = self
@@ -95,6 +127,11 @@ impl<'a, A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'a, Running, A, R, C
                     .with_ref(|s| s.parent_ds.parent_port_identity);
                 if parent_port_identity != tlv.sender_identity {
                     // Ignore, shouldn't be forwarded
+                    continue;
+                }
+
+                // Don't forward PATH_TRACE TLVs, we processed them and added our own
+                if path_trace_enabled && tlv.tlv.tlv_type == TlvType::PathTrace {
                     continue;
                 }
 
