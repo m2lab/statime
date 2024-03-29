@@ -8,7 +8,6 @@ pub use actions::{
     ForwardedTLV, ForwardedTLVProvider, NoForwardedTLVs, PortAction, PortActionIterator,
     TimestampContext,
 };
-use atomic_refcell::{AtomicRef, AtomicRefCell};
 pub use measurement::Measurement;
 use rand::Rng;
 use state::PortState;
@@ -29,8 +28,8 @@ use crate::{
         messages::{Message, MessageBody},
     },
     filters::Filter,
-    ptp_instance::PtpInstanceState,
     time::{Duration, Time},
+    LockablePtpInstance,
 };
 
 // Needs to be here because of use rules
@@ -226,7 +225,8 @@ pub(crate) mod state;
 /// #         pub fn recv(&mut self) -> Option<(&'static [u8], statime::time::Time)> { unimplemented!() }
 /// #    }
 /// # }
-/// # struct MyPortResources {
+/// # struct MyPortResources<F> {
+/// #     ptp_instance: statime::PtpInstance<F>,
 /// #     announce_timer: system::Timer,
 /// #     sync_timer: system::Timer,
 /// #     delay_req_timer: system::Timer,
@@ -243,23 +243,24 @@ pub(crate) mod state;
 /// use statime::filters::Filter;
 /// use statime::port::{NoForwardedTLVs, Port, PortActionIterator, Running};
 ///
-/// fn something_happend(resources: &mut MyPortResources, running_port: &mut Port<Running, impl AcceptableMasterList, impl Rng, impl Clock, impl Filter>) {
+/// fn something_happend<F: Filter>(resources: &mut MyPortResources<F>, running_port: &mut Port<Running, impl AcceptableMasterList, impl Rng, impl Clock, F>) {
+///     let instance = &mut resources.ptp_instance;
 ///     let actions = if resources.announce_timer.has_expired() {
-///         running_port.handle_announce_timer(&mut NoForwardedTLVs)
+///         running_port.handle_announce_timer(instance, &mut NoForwardedTLVs)
 ///     } else if resources.sync_timer.has_expired() {
-///         running_port.handle_sync_timer()
+///         running_port.handle_sync_timer(instance)
 ///     } else if resources.delay_req_timer.has_expired() {
-///         running_port.handle_delay_request_timer()
+///         running_port.handle_delay_request_timer(instance)
 ///     } else if resources.announce_receipt_timer.has_expired() {
 ///         running_port.handle_announce_receipt_timer()
 ///     } else if resources.filter_update_timer.has_expired() {
 ///         running_port.handle_filter_update_timer()
 ///     } else if let Some((data, timestamp)) = resources.time_critical_socket.recv() {
-///         running_port.handle_event_receive(data, timestamp)
+///         running_port.handle_event_receive(instance, data, timestamp)
 ///     } else if let Some((data, _timestamp)) = resources.general_socket.recv() {
-///         running_port.handle_general_receive(data)
+///         running_port.handle_general_receive(instance, data)
 ///     } else if let Some((context, timestamp)) = resources.send_timestamp.take() {
-///         running_port.handle_send_timestamp(context, timestamp)
+///         running_port.handle_send_timestamp(instance, context, timestamp)
 ///     } else {
 ///         PortActionIterator::empty()
 ///     };
@@ -313,32 +314,29 @@ enum PeerDelayState {
 
 /// Type state of [`Port`] entered by [`Port::end_bmca`]
 #[derive(Debug)]
-pub struct Running<'a> {
-    state_refcell: &'a AtomicRefCell<PtpInstanceState>,
-    state: AtomicRef<'a, PtpInstanceState>,
-}
+pub struct Running;
 
 /// Type state of [`Port`] entered by [`Port::start_bmca`]
 #[derive(Debug)]
-pub struct InBmca<'a> {
+pub struct InBmca {
     pending_action: PortActionIterator<'static>,
     local_best: Option<BestAnnounceMessage>,
-    state_refcell: &'a AtomicRefCell<PtpInstanceState>,
 }
 
-impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>, A, R, C, F> {
+impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C, F> {
     /// Inform the port about a transmit timestamp being available
     ///
     /// `context` is the handle of the packet that was send from the
     /// [`PortAction::SendEvent`] that caused the send.
     pub fn handle_send_timestamp(
         &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
         context: TimestampContext,
         timestamp: Time,
     ) -> PortActionIterator<'_> {
         match context.inner {
             actions::TimestampContextInner::Sync { id } => {
-                self.handle_sync_timestamp(id, timestamp)
+                self.handle_sync_timestamp(ptp_instance, id, timestamp)
             }
             actions::TimestampContextInner::DelayReq { id } => {
                 self.handle_delay_timestamp(id, timestamp)
@@ -349,26 +347,38 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
             actions::TimestampContextInner::PDelayResp {
                 id,
                 requestor_identity,
-            } => self.handle_pdelay_response_timestamp(id, requestor_identity, timestamp),
+            } => self.handle_pdelay_response_timestamp(
+                ptp_instance,
+                id,
+                requestor_identity,
+                timestamp,
+            ),
         }
     }
 
     /// Handle the announce timer going off
     pub fn handle_announce_timer(
         &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
         tlv_provider: &mut impl ForwardedTLVProvider,
     ) -> PortActionIterator<'_> {
-        self.send_announce(tlv_provider)
+        self.send_announce(ptp_instance, tlv_provider)
     }
 
     /// Handle the sync timer going off
-    pub fn handle_sync_timer(&mut self) -> PortActionIterator<'_> {
-        self.send_sync()
+    pub fn handle_sync_timer(
+        &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
+    ) -> PortActionIterator<'_> {
+        self.send_sync(ptp_instance)
     }
 
     /// Handle the delay request timer going off
-    pub fn handle_delay_request_timer(&mut self) -> PortActionIterator<'_> {
-        self.send_delay_request()
+    pub fn handle_delay_request_timer(
+        &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
+    ) -> PortActionIterator<'_> {
+        self.send_delay_request(ptp_instance)
     }
 
     /// Handle the announce receipt timer going off
@@ -402,7 +412,7 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
 
     /// Set this [`Port`] into [`InBmca`] mode to use it with
     /// [`PtpInstance::bmca`].
-    pub fn start_bmca(self) -> Port<InBmca<'a>, A, R, C, F> {
+    pub fn start_bmca(self) -> Port<InBmca, A, R, C, F> {
         Port {
             port_state: self.port_state,
             config: self.config,
@@ -415,7 +425,6 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
             lifecycle: InBmca {
                 pending_action: actions![],
                 local_best: None,
-                state_refcell: self.lifecycle.state_refcell,
             },
             announce_seq_ids: self.announce_seq_ids,
             sync_seq_ids: self.sync_seq_ids,
@@ -431,6 +440,7 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
     // parse and do basic domain filtering on message
     fn parse_and_filter<'b>(
         &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
         data: &'b [u8],
     ) -> ControlFlow<PortActionIterator<'b>, Message<'b>> {
         let message = match Message::deserialize(data) {
@@ -440,8 +450,9 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
                 return ControlFlow::Break(actions![]);
             }
         };
-        if message.header().sdo_id != self.lifecycle.state.default_ds.sdo_id
-            || message.header().domain_number != self.lifecycle.state.default_ds.domain_number
+        let instance_state = &ptp_instance.read().state;
+        if message.header().sdo_id != instance_state.default_ds.sdo_id
+            || message.header().domain_number != instance_state.default_ds.domain_number
         {
             return ControlFlow::Break(actions![]);
         }
@@ -451,10 +462,11 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
     /// Handle a message over the event channel
     pub fn handle_event_receive<'b>(
         &'b mut self,
+        mut ptp_instance: impl LockablePtpInstance<Filter = F>,
         data: &'b [u8],
         timestamp: Time,
     ) -> PortActionIterator<'b> {
-        let message = match self.parse_and_filter(data) {
+        let message = match self.parse_and_filter(&mut ptp_instance, data) {
             ControlFlow::Continue(value) => value,
             ControlFlow::Break(value) => return value,
         };
@@ -464,7 +476,9 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
             MessageBody::DelayReq(delay_request) => {
                 self.handle_delay_req(message.header, delay_request, timestamp)
             }
-            MessageBody::PDelayReq(_) => self.handle_pdelay_req(message.header, timestamp),
+            MessageBody::PDelayReq(_) => {
+                self.handle_pdelay_req(&mut ptp_instance, message.header, timestamp)
+            }
             MessageBody::PDelayResp(peer_delay_response) => {
                 self.handle_peer_delay_response(message.header, peer_delay_response, timestamp)
             }
@@ -473,8 +487,12 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
     }
 
     /// Handle a general ptp message
-    pub fn handle_general_receive<'b>(&'b mut self, data: &'b [u8]) -> PortActionIterator<'b> {
-        let message = match self.parse_and_filter(data) {
+    pub fn handle_general_receive<'b>(
+        &'b mut self,
+        mut ptp_instance: impl LockablePtpInstance<Filter = F>,
+        data: &'b [u8],
+    ) -> PortActionIterator<'b> {
+        let message = match self.parse_and_filter(&mut ptp_instance, data) {
             ControlFlow::Continue(value) => value,
             ControlFlow::Break(value) => return value,
         };
@@ -504,10 +522,10 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
     }
 }
 
-impl<'a, A, C, F: Filter, R> Port<InBmca<'a>, A, R, C, F> {
+impl<A, C, F: Filter, R> Port<InBmca, A, R, C, F> {
     /// End a BMCA cycle and make the
     /// [`handle_*`](`Port::handle_send_timestamp`) methods available again
-    pub fn end_bmca(self) -> (Port<Running<'a>, A, R, C, F>, PortActionIterator<'static>) {
+    pub fn end_bmca(self) -> (Port<Running, A, R, C, F>, PortActionIterator<'static>) {
         (
             Port {
                 port_state: self.port_state,
@@ -518,10 +536,7 @@ impl<'a, A, C, F: Filter, R> Port<InBmca<'a>, A, R, C, F> {
                 bmca: self.bmca,
                 rng: self.rng,
                 packet_buffer: [0; MAX_DATA_LEN],
-                lifecycle: Running {
-                    state_refcell: self.lifecycle.state_refcell,
-                    state: self.lifecycle.state_refcell.borrow(),
-                },
+                lifecycle: Running,
                 announce_seq_ids: self.announce_seq_ids,
                 sync_seq_ids: self.sync_seq_ids,
                 delay_seq_ids: self.delay_seq_ids,
@@ -574,10 +589,9 @@ impl<L, A, R, C, F: Filter> Port<L, A, R, C, F> {
     }
 }
 
-impl<'a, A, C, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
+impl<A, C, F: Filter, R: Rng> Port<InBmca, A, R, C, F> {
     /// Create a new port from a port dataset on a given interface.
     pub(crate) fn new(
-        state_refcell: &'a AtomicRefCell<PtpInstanceState>,
         config: PortConfig<A>,
         filter_config: F::Config,
         clock: C,
@@ -613,7 +627,6 @@ impl<'a, A, C, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
             lifecycle: InBmca {
                 pending_action: actions![PortAction::ResetAnnounceReceiptTimer { duration }],
                 local_best: None,
-                state_refcell,
             },
             announce_seq_ids: SequenceIdGenerator::new(),
             sync_seq_ids: SequenceIdGenerator::new(),
@@ -628,15 +641,12 @@ impl<'a, A, C, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
 
 #[cfg(test)]
 mod tests {
-    use atomic_refcell::AtomicRefCell;
-
     use super::*;
     use crate::{
         config::{AcceptAnyMaster, DelayMechanism, InstanceConfig, TimePropertiesDS},
-        datastructures::datasets::{InternalDefaultDS, InternalParentDS},
         filters::BasicFilter,
         time::{Duration, Interval, Time},
-        Clock,
+        Clock, PtpInstance,
     };
 
     // General test infra
@@ -666,10 +676,8 @@ mod tests {
     }
 
     pub(super) fn setup_test_port(
-        state: &AtomicRefCell<PtpInstanceState>,
-    ) -> Port<Running<'_>, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
+    ) -> Port<Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
         let port = Port::<_, _, _, _, BasicFilter>::new(
-            &state,
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
@@ -692,11 +700,9 @@ mod tests {
     }
 
     pub(super) fn setup_test_port_custom_filter<F: Filter>(
-        state: &AtomicRefCell<PtpInstanceState>,
         filter_config: F::Config,
-    ) -> Port<Running<'_>, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, F> {
+    ) -> Port<Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, F> {
         let port = Port::<_, _, _, _, F>::new(
-            &state,
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
@@ -718,24 +724,17 @@ mod tests {
         port
     }
 
-    pub(super) fn setup_test_state() -> AtomicRefCell<PtpInstanceState> {
-        let default_ds = InternalDefaultDS::new(InstanceConfig {
-            clock_identity: Default::default(),
-            priority_1: 255,
-            priority_2: 255,
-            domain_number: 0,
-            slave_only: false,
-            sdo_id: Default::default(),
-        });
-
-        let parent_ds = InternalParentDS::new(default_ds);
-
-        let state = AtomicRefCell::new(PtpInstanceState {
-            default_ds,
-            current_ds: Default::default(),
-            parent_ds,
-            time_properties_ds: Default::default(),
-        });
-        state
+    pub(super) fn setup_test_instance<F>() -> PtpInstance<F> {
+        PtpInstance::new(
+            InstanceConfig {
+                clock_identity: Default::default(),
+                priority_1: 255,
+                priority_2: 255,
+                domain_number: 0,
+                slave_only: false,
+                sdo_id: Default::default(),
+            },
+            Default::default(),
+        )
     }
 }

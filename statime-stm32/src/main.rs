@@ -12,7 +12,7 @@ use embassy_sync::waitqueue::WakerRegistration;
 use ethernet::{DmaResources, NetworkStack};
 use futures::future::FutureExt;
 use panic_probe as _;
-use rtic::{app, Mutex};
+use rtic::{app, mutex_prelude::*, Mutex};
 use rtic_monotonics::systick::{ExtU64, Systick};
 use rtic_sync::{channel::Receiver, make_channel};
 use smoltcp::{
@@ -51,6 +51,7 @@ mod app {
     #[shared]
     struct Shared {
         net: NetworkStack,
+        ptp_instance: PtpInstance<BasicFilter>,
         ptp_port: port::Port,
         tx_waker: WakerRegistration,
     }
@@ -213,7 +214,7 @@ mod app {
                 .unwrap_or_else(|_| defmt::panic!("Failed to start timers"));
 
             // Handle BMCA phase for statime
-            instance_bmca::spawn(ptp_instance)
+            instance_bmca::spawn()
                 .unwrap_or_else(|_| defmt::panic!("Failed to start instance bmca"));
 
             // Poll network interfaces and run DHCP
@@ -224,6 +225,7 @@ mod app {
         (
             Shared {
                 net,
+                ptp_instance,
                 ptp_port,
                 tx_waker: WakerRegistration::new(),
             },
@@ -232,27 +234,26 @@ mod app {
     }
 
     /// Task that runs the BMCA every required interval
-    #[task(shared = [net, ptp_port], priority = 1)]
-    async fn instance_bmca(
-        mut cx: instance_bmca::Context,
-        ptp_instance: &'static PtpInstance<BasicFilter>,
-    ) {
+    #[task(shared = [net, ptp_instance, ptp_port], priority = 1)]
+    async fn instance_bmca(mut cx: instance_bmca::Context) {
         let net = &mut cx.shared.net;
-        let ptp_port = &mut cx.shared.ptp_port;
 
         loop {
+            let ptp_instance = &mut cx.shared.ptp_instance;
+            let ptp_port = &mut cx.shared.ptp_port;
+
             // Run the BMCA with our single port
-            ptp_port.lock(|ptp_port| {
+            let wait_duration = (ptp_instance, ptp_port).lock(|ptp_instance, ptp_port| {
                 ptp_port.perform_bmca(
                     |bmca_port| {
                         ptp_instance.bmca(&mut [bmca_port]);
                     },
                     net,
                 );
-            });
 
+                ptp_instance.bmca_interval()
+            });
             // Wait for the given time before running again
-            let wait_duration = ptp_instance.bmca_interval();
             Systick::delay((wait_duration.as_millis() as u64).millis()).await;
         }
     }
@@ -260,13 +261,12 @@ mod app {
     /// Task that runs the timers and lets the port handle the expired timers.
     /// The channel is used for resetting the timers (which comes from the port
     /// actions and get sent here).
-    #[task(shared = [net, ptp_port], priority = 0)]
+    #[task(shared = [net, ptp_instance, ptp_port], priority = 0)]
     async fn statime_timers(
         mut cx: statime_timers::Context,
         mut timer_resets: Receiver<'static, (TimerName, core::time::Duration), 4>,
     ) {
         let net = &mut cx.shared.net;
-        let ptp_port = &mut cx.shared.ptp_port;
 
         let mut announce_timer_delay = pin!(Systick::delay(24u64.hours()).fuse());
         let mut sync_timer_delay = pin!(Systick::delay(24u64.hours()).fuse());
@@ -275,21 +275,34 @@ mod app {
         let mut filter_update_timer_delay = pin!(Systick::delay(24u64.hours()).fuse());
 
         loop {
+            let ptp_instance = &mut cx.shared.ptp_instance;
+            let ptp_port = &mut cx.shared.ptp_port;
+
             futures::select_biased! {
                 _ = announce_timer_delay => {
-                    ptp_port.lock(|port| port.handle_timer(TimerName::Announce, net));
+                    (ptp_instance, ptp_port).lock(|instance, port| {
+                        port.handle_timer(instance, TimerName::Announce, net)
+                    });
                 }
                 _ = sync_timer_delay => {
-                    ptp_port.lock(|port| port.handle_timer(TimerName::Sync, net));
+                    (ptp_instance, ptp_port).lock(|instance, port| {
+                        port.handle_timer(instance, TimerName::Sync, net)
+                    });
                 }
                 _ = delay_request_timer_delay => {
-                    ptp_port.lock(|port| port.handle_timer(TimerName::DelayRequest, net));
+                    (ptp_instance, ptp_port).lock(|instance, port| {
+                        port.handle_timer(instance, TimerName::DelayRequest, net)
+                    });
                 }
                 _ = announce_receipt_timer_delay => {
-                    ptp_port.lock(|port| port.handle_timer(TimerName::AnnounceReceipt, net));
+                    (ptp_instance, ptp_port).lock(|instance, port| {
+                        port.handle_timer(instance, TimerName::AnnounceReceipt, net)
+                    });
                 }
                 _ = filter_update_timer_delay => {
-                    ptp_port.lock(|port| port.handle_timer(TimerName::FilterUpdate, net));
+                    (ptp_instance, ptp_port).lock(|instance, port| {
+                        port.handle_timer(instance, TimerName::FilterUpdate, net)
+                    });
                 }
                 reset = timer_resets.recv().fuse() => {
                     let (timer, delay_time) = unwrap!(reset.ok());
@@ -315,7 +328,7 @@ mod app {
     /// case the packet ID is not known yet it will retry a few times to handle
     /// the case where a packet is not send directly (e.g. because ARP is
     /// fetching the receivers mac address).
-    #[task(shared = [net, ptp_port, tx_waker], priority = 0)]
+    #[task(shared = [net, ptp_instance, ptp_port, tx_waker], priority = 0)]
     async fn tx_timestamp_listener(
         mut cx: tx_timestamp_listener::Context,
         mut packet_id_receiver: Receiver<'static, (TimestampContext, PacketId), 16>,
@@ -323,9 +336,11 @@ mod app {
         // Extract state to keep code more readable
         let tx_waker = &mut cx.shared.tx_waker;
         let net = &mut cx.shared.net;
-        let ptp_port = &mut cx.shared.ptp_port;
 
         loop {
+            let ptp_instance = &mut cx.shared.ptp_instance;
+            let ptp_port = &mut cx.shared.ptp_port;
+
             // Wait for the next (smoltcp) packet id and its (statime) timestamp context
             let (timestamp_context, packet_id) = unwrap!(packet_id_receiver.recv().await.ok());
 
@@ -353,9 +368,10 @@ mod app {
             .await;
 
             match timestamp {
-                Some(timestamp) => ptp_port.lock(|port| {
+                Some(timestamp) => (ptp_instance, ptp_port).lock(|instance, port| {
                     // Inform statime about the timestamp we collected
                     port.handle_send_timestamp(
+                        instance,
                         timestamp_context,
                         stm_time_to_statime(timestamp),
                         net,
@@ -381,22 +397,34 @@ mod app {
     }
 
     /// Listen for packets on the event udp socket
-    #[task(shared = [net, ptp_port], priority = 1)]
+    #[task(shared = [net, ptp_instance, ptp_port], priority = 1)]
     async fn event_listen(mut cx: event_listen::Context) {
         let socket = cx.shared.ptp_port.lock(|ptp_port| ptp_port.event_socket());
 
-        listen_and_handle::<true>(&mut cx.shared.net, socket, &mut cx.shared.ptp_port).await
+        listen_and_handle::<true>(
+            &mut cx.shared.net,
+            socket,
+            &mut cx.shared.ptp_instance,
+            &mut cx.shared.ptp_port,
+        )
+        .await
     }
 
     /// Listen for packets on the general udp socket
-    #[task(shared = [net, ptp_port], priority = 0)]
+    #[task(shared = [net, ptp_instance, ptp_port], priority = 0)]
     async fn general_listen(mut cx: general_listen::Context) {
         let socket = cx
             .shared
             .ptp_port
             .lock(|ptp_port| ptp_port.general_socket());
 
-        listen_and_handle::<false>(&mut cx.shared.net, socket, &mut cx.shared.ptp_port).await
+        listen_and_handle::<false>(
+            &mut cx.shared.net,
+            socket,
+            &mut cx.shared.ptp_instance,
+            &mut cx.shared.ptp_port,
+        )
+        .await
     }
 
     /// Listen for packets on the given socket
@@ -407,6 +435,7 @@ mod app {
     async fn listen_and_handle<const IS_EVENT: bool>(
         net: &mut impl Mutex<T = NetworkStack>,
         socket: SocketHandle,
+        instance: &mut impl Mutex<T = PtpInstance<BasicFilter>>,
         port: &mut impl Mutex<T = port::Port>,
     ) {
         // Get a local buffer to store the received packet
@@ -425,11 +454,11 @@ mod app {
             let data = &buffer[..len];
 
             // Inform statime about the new packet
-            port.lock(|port| {
+            (&mut *instance, &mut *port).lock(|instance, port| {
                 if IS_EVENT {
-                    port.handle_event_receive(data, stm_time_to_statime(timestamp), net);
+                    port.handle_event_receive(instance, data, stm_time_to_statime(timestamp), net);
                 } else {
-                    port.handle_general_receive(data, net);
+                    port.handle_general_receive(instance, data, net);
                 };
             });
         }

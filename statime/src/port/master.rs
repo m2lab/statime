@@ -7,24 +7,31 @@ use crate::{
     filters::Filter,
     port::{actions::TimestampContextInner, PortAction, TimestampContext},
     time::Time,
+    LockablePtpInstance,
 };
 
-impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
-    pub(super) fn send_sync(&mut self) -> PortActionIterator {
+impl<A, C, F: Filter, R> Port<Running, A, R, C, F> {
+    pub(super) fn send_sync(
+        &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
+    ) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
             log::trace!("sending sync message");
 
             let seq_id = self.sync_seq_ids.generate();
-            let packet_length =
-                match Message::sync(&self.lifecycle.state.default_ds, self.port_identity, seq_id)
-                    .serialize(&mut self.packet_buffer)
-                {
-                    Ok(message) => message,
-                    Err(error) => {
-                        log::error!("Statime bug: Could not serialize sync: {:?}", error);
-                        return actions![];
-                    }
-                };
+            let packet_length = match Message::sync(
+                &ptp_instance.read().state.default_ds,
+                self.port_identity,
+                seq_id,
+            )
+            .serialize(&mut self.packet_buffer)
+            {
+                Ok(message) => message,
+                Err(error) => {
+                    log::error!("Statime bug: Could not serialize sync: {:?}", error);
+                    return actions![];
+                }
+            };
 
             actions![
                 PortAction::ResetSyncTimer {
@@ -43,10 +50,15 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
         }
     }
 
-    pub(super) fn handle_sync_timestamp(&mut self, id: u16, timestamp: Time) -> PortActionIterator {
+    pub(super) fn handle_sync_timestamp(
+        &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
+        id: u16,
+        timestamp: Time,
+    ) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
             let packet_length = match Message::follow_up(
-                &self.lifecycle.state.default_ds,
+                &ptp_instance.read().state.default_ds,
                 self.port_identity,
                 id,
                 timestamp,
@@ -74,6 +86,7 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
     pub(super) fn send_announce(
         &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
         tlv_provider: &mut impl ForwardedTLVProvider,
     ) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
@@ -83,7 +96,7 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
             let mut tlv_builder = TlvSetBuilder::new(&mut tlv_buffer);
 
             let mut message = Message::announce(
-                &self.lifecycle.state,
+                &ptp_instance.read().state,
                 self.port_identity,
                 self.announce_seq_ids.generate(),
             );
@@ -91,7 +104,7 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
             while let Some(tlv) = tlv_provider.next_if_smaller(tlv_margin) {
                 assert!(tlv.size() < tlv_margin);
-                if self.lifecycle.state.parent_ds.parent_port_identity != tlv.sender_identity {
+                if ptp_instance.read().state.parent_ds.parent_port_identity != tlv.sender_identity {
                     // Ignore, shouldn't be forwarded
                     continue;
                 }
@@ -163,12 +176,13 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
     pub(super) fn handle_pdelay_req(
         &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
         header: Header,
         timestamp: Time,
     ) -> PortActionIterator {
         log::debug!("Received PDelayReq");
         let pdelay_resp_message = Message::pdelay_resp(
-            &self.lifecycle.state.default_ds,
+            &ptp_instance.read().state.default_ds,
             self.port_identity,
             header,
             timestamp,
@@ -196,12 +210,13 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
     pub(super) fn handle_pdelay_response_timestamp(
         &mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
         id: u16,
         requestor_identity: PortIdentity,
         timestamp: Time,
     ) -> PortActionIterator {
         let pdelay_resp_follow_up_messgae = Message::pdelay_resp_follow_up(
-            &self.lifecycle.state.default_ds,
+            &ptp_instance.read().state.default_ds,
             self.port_identity,
             requestor_identity,
             id,
@@ -235,7 +250,7 @@ mod tests {
             messages::{Header, MessageBody},
         },
         port::{
-            tests::{setup_test_port, setup_test_state},
+            tests::{setup_test_instance, setup_test_port},
             NoForwardedTLVs,
         },
         time::Interval,
@@ -243,9 +258,7 @@ mod tests {
 
     #[test]
     fn test_delay_response() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         port.set_forced_port_state(PortState::Master);
 
@@ -357,21 +370,17 @@ mod tests {
 
     #[test]
     fn test_announce() {
-        let state = setup_test_state();
+        let mut instance = setup_test_instance();
+        instance.state.default_ds.priority_1 = 15;
+        instance.state.default_ds.priority_2 = 128;
+        instance.state.parent_ds.grandmaster_priority_1 = 15;
+        instance.state.parent_ds.grandmaster_priority_2 = 128;
 
-        let mut state_ref = state.borrow_mut();
-        state_ref.default_ds.priority_1 = 15;
-        state_ref.default_ds.priority_2 = 128;
-        state_ref.parent_ds.grandmaster_priority_1 = 15;
-        state_ref.parent_ds.grandmaster_priority_2 = 128;
-
-        drop(state_ref);
-
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         port.set_forced_port_state(PortState::Master);
 
-        let mut actions = port.send_announce(&mut NoForwardedTLVs);
+        let mut actions = port.send_announce(&mut instance, &mut NoForwardedTLVs);
 
         assert!(matches!(
             actions.next(),
@@ -397,7 +406,7 @@ mod tests {
 
         assert_eq!(msg.grandmaster_priority_1, 15);
 
-        let mut actions = port.send_announce(&mut NoForwardedTLVs);
+        let mut actions = port.send_announce(&mut instance, &mut NoForwardedTLVs);
 
         assert!(matches!(
             actions.next(),
@@ -426,20 +435,17 @@ mod tests {
 
     #[test]
     fn test_sync() {
-        let state = setup_test_state();
+        let mut instance = setup_test_instance();
 
-        let mut state_ref = state.borrow_mut();
-        state_ref.default_ds.priority_1 = 15;
-        state_ref.default_ds.priority_2 = 128;
-        state_ref.parent_ds.grandmaster_priority_1 = 15;
-        state_ref.parent_ds.grandmaster_priority_2 = 128;
+        instance.state.default_ds.priority_1 = 15;
+        instance.state.default_ds.priority_2 = 128;
+        instance.state.parent_ds.grandmaster_priority_1 = 15;
+        instance.state.parent_ds.grandmaster_priority_2 = 128;
 
-        drop(state_ref);
-
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         port.set_forced_port_state(PortState::Master);
-        let mut actions = port.send_sync();
+        let mut actions = port.send_sync(&mut instance);
 
         assert!(matches!(
             actions.next(),
@@ -470,6 +476,7 @@ mod tests {
         };
 
         let mut actions = port.handle_sync_timestamp(
+            &mut instance,
             id,
             Time::from_fixed_nanos(U96F32::from_bits((601300 << 32) + (230 << 16))),
         );
@@ -506,7 +513,7 @@ mod tests {
             TimeInterval(I48F16::from_bits(230))
         );
 
-        let mut actions = port.send_sync();
+        let mut actions = port.send_sync(&mut instance);
 
         assert!(matches!(
             actions.next(),
@@ -537,6 +544,7 @@ mod tests {
         };
 
         let mut actions = port.handle_sync_timestamp(
+            &mut instance,
             id,
             Time::from_fixed_nanos(U96F32::from_bits((1000601300 << 32) + (543 << 16))),
         );
@@ -576,11 +584,11 @@ mod tests {
 
     #[test]
     fn test_peer_delay() {
-        let state = setup_test_state();
+        let mut instance = setup_test_instance();
+        let mut port = setup_test_port();
 
-        let mut port = setup_test_port(&state);
-
-        let mut actions = port.handle_pdelay_req(Header::default(), Time::from_micros(500));
+        let mut actions =
+            port.handle_pdelay_req(&mut instance, Header::default(), Time::from_micros(500));
 
         let Some(PortAction::SendEvent {
             context,
@@ -603,7 +611,8 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(550));
+        let mut actions =
+            port.handle_send_timestamp(&mut instance, context, Time::from_micros(550));
 
         let Some(PortAction::SendGeneral {
             data,
