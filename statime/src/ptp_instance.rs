@@ -3,7 +3,6 @@ use core::{
     sync::atomic::{AtomicI8, Ordering},
 };
 
-use atomic_refcell::AtomicRefCell;
 use rand::Rng;
 
 #[allow(unused_imports)]
@@ -84,13 +83,14 @@ use crate::{
 /// }
 /// ```
 pub struct PtpInstance<F> {
-    state: AtomicRefCell<PtpInstanceState>,
+    state: PtpInstanceState,
     log_bmca_interval: AtomicI8,
     _filter: PhantomData<F>,
 }
 
+/// Current state of the PTP Instance
 #[derive(Debug)]
-pub(crate) struct PtpInstanceState {
+pub struct PtpInstanceState {
     pub(crate) default_ds: InternalDefaultDS,
     pub(crate) current_ds: InternalCurrentDS,
     pub(crate) parent_ds: InternalParentDS,
@@ -100,7 +100,7 @@ pub(crate) struct PtpInstanceState {
 impl PtpInstanceState {
     fn bmca<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng>(
         &mut self,
-        ports: &mut [&mut Port<InBmca<'_>, A, R, C, F>],
+        ports: &mut [&mut Port<InBmca, A, R, C, F>],
         bmca_interval: Duration,
     ) {
         debug_assert_eq!(self.default_ds.number_ports as usize, ports.len());
@@ -153,35 +153,45 @@ impl<F> PtpInstance<F> {
         let default_ds = InternalDefaultDS::new(config);
 
         Self {
-            state: AtomicRefCell::new(PtpInstanceState {
+            state: PtpInstanceState {
                 default_ds,
                 current_ds: Default::default(),
                 parent_ds: InternalParentDS::new(default_ds),
                 time_properties_ds,
-            }),
+            },
             log_bmca_interval: AtomicI8::new(i8::MAX),
             _filter: PhantomData,
         }
     }
 
+    /// Return a reference to the instance's state
+    pub fn state(&self) -> &PtpInstanceState {
+        &self.state
+    }
+
+    /// Return a mutable reference to the instance's state
+    pub fn state_mut(&mut self) -> &mut PtpInstanceState {
+        &mut self.state
+    }
+
     /// Return IEEE-1588 defaultDS for introspection
     pub fn default_ds(&self) -> DefaultDS {
-        (&self.state.borrow().default_ds).into()
+        (&self.state.default_ds).into()
     }
 
     /// Return IEEE-1588 currentDS for introspection
     pub fn current_ds(&self) -> CurrentDS {
-        (&self.state.borrow().current_ds).into()
+        (&self.state.current_ds).into()
     }
 
     /// Return IEEE-1588 parentDS for introspection
     pub fn parent_ds(&self) -> ParentDS {
-        (&self.state.borrow().parent_ds).into()
+        (&self.state.parent_ds).into()
     }
 
     /// Return IEEE-1588 timePropertiesDS for introspection
     pub fn time_properties_ds(&self) -> TimePropertiesDS {
-        self.state.borrow().time_properties_ds
+        self.state.time_properties_ds
     }
 }
 
@@ -195,23 +205,22 @@ impl<F: Filter> PtpInstance<F> {
     /// clock, and for synchronizing this clock with the instance clock as
     /// appropriate based on the ports state.
     pub fn add_port<A, C, R: Rng>(
-        &self,
+        &mut self,
         config: PortConfig<A>,
         filter_config: F::Config,
         clock: C,
         rng: R,
-    ) -> Port<InBmca<'_>, A, R, C, F> {
+    ) -> Port<InBmca, A, R, C, F> {
+        // TODO: Remove atomic, self is now borrowed mutably
         self.log_bmca_interval
             .fetch_min(config.announce_interval.as_log_2(), Ordering::Relaxed);
-        let mut state = self.state.borrow_mut();
         let port_identity = PortIdentity {
-            clock_identity: state.default_ds.clock_identity,
-            port_number: state.default_ds.number_ports,
+            clock_identity: self.state.default_ds.clock_identity,
+            port_number: self.state.default_ds.number_ports,
         };
-        state.default_ds.number_ports += 1;
+        self.state.default_ds.number_ports += 1;
 
         Port::new(
-            &self.state,
             config,
             filter_config,
             clock,
@@ -225,10 +234,10 @@ impl<F: Filter> PtpInstance<F> {
     /// The caller must pass all the ports that were created on this instance in
     /// the slice!
     pub fn bmca<A: AcceptableMasterList, C: Clock, R: Rng>(
-        &self,
-        ports: &mut [&mut Port<InBmca<'_>, A, R, C, F>],
+        &mut self,
+        ports: &mut [&mut Port<InBmca, A, R, C, F>],
     ) {
-        self.state.borrow_mut().bmca(
+        self.state.bmca(
             ports,
             Duration::from_seconds(
                 2f64.powi(self.log_bmca_interval.load(Ordering::Relaxed) as i32),

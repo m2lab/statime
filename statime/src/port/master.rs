@@ -6,17 +6,18 @@ use crate::{
     },
     filters::Filter,
     port::{actions::TimestampContextInner, PortAction, TimestampContext},
+    ptp_instance::PtpInstanceState,
     time::Time,
 };
 
-impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
-    pub(super) fn send_sync(&mut self) -> PortActionIterator {
+impl<A, C, F: Filter, R> Port<Running, A, R, C, F> {
+    pub(super) fn send_sync(&mut self, instance_state: &PtpInstanceState) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
             log::trace!("sending sync message");
 
             let seq_id = self.sync_seq_ids.generate();
             let packet_length =
-                match Message::sync(&self.lifecycle.state.default_ds, self.port_identity, seq_id)
+                match Message::sync(&instance_state.default_ds, self.port_identity, seq_id)
                     .serialize(&mut self.packet_buffer)
                 {
                     Ok(message) => message,
@@ -43,10 +44,15 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
         }
     }
 
-    pub(super) fn handle_sync_timestamp(&mut self, id: u16, timestamp: Time) -> PortActionIterator {
+    pub(super) fn handle_sync_timestamp(
+        &mut self,
+        instance_state: &PtpInstanceState,
+        id: u16,
+        timestamp: Time,
+    ) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
             let packet_length = match Message::follow_up(
-                &self.lifecycle.state.default_ds,
+                &instance_state.default_ds,
                 self.port_identity,
                 id,
                 timestamp,
@@ -74,6 +80,7 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
     pub(super) fn send_announce(
         &mut self,
+        instance_state: &PtpInstanceState,
         tlv_provider: &mut impl ForwardedTLVProvider,
     ) -> PortActionIterator {
         if matches!(self.port_state, PortState::Master) {
@@ -83,7 +90,7 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
             let mut tlv_builder = TlvSetBuilder::new(&mut tlv_buffer);
 
             let mut message = Message::announce(
-                &self.lifecycle.state,
+                instance_state,
                 self.port_identity,
                 self.announce_seq_ids.generate(),
             );
@@ -91,7 +98,7 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
             while let Some(tlv) = tlv_provider.next_if_smaller(tlv_margin) {
                 assert!(tlv.size() < tlv_margin);
-                if self.lifecycle.state.parent_ds.parent_port_identity != tlv.sender_identity {
+                if instance_state.parent_ds.parent_port_identity != tlv.sender_identity {
                     // Ignore, shouldn't be forwarded
                     continue;
                 }
@@ -163,12 +170,13 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
     pub(super) fn handle_pdelay_req(
         &mut self,
+        instance_state: &PtpInstanceState,
         header: Header,
         timestamp: Time,
     ) -> PortActionIterator {
         log::debug!("Received PDelayReq");
         let pdelay_resp_message = Message::pdelay_resp(
-            &self.lifecycle.state.default_ds,
+            &instance_state.default_ds,
             self.port_identity,
             header,
             timestamp,
@@ -196,12 +204,13 @@ impl<'a, A, C, F: Filter, R> Port<Running<'a>, A, R, C, F> {
 
     pub(super) fn handle_pdelay_response_timestamp(
         &mut self,
+        instance_state: &PtpInstanceState,
         id: u16,
         requestor_identity: PortIdentity,
         timestamp: Time,
     ) -> PortActionIterator {
         let pdelay_resp_follow_up_messgae = Message::pdelay_resp_follow_up(
-            &self.lifecycle.state.default_ds,
+            &instance_state.default_ds,
             self.port_identity,
             requestor_identity,
             id,
@@ -243,9 +252,7 @@ mod tests {
 
     #[test]
     fn test_delay_response() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         port.set_forced_port_state(PortState::Master);
 
@@ -357,21 +364,17 @@ mod tests {
 
     #[test]
     fn test_announce() {
-        let state = setup_test_state();
+        let mut instance_state = setup_test_state();
+        instance_state.default_ds.priority_1 = 15;
+        instance_state.default_ds.priority_2 = 128;
+        instance_state.parent_ds.grandmaster_priority_1 = 15;
+        instance_state.parent_ds.grandmaster_priority_2 = 128;
 
-        let mut state_ref = state.borrow_mut();
-        state_ref.default_ds.priority_1 = 15;
-        state_ref.default_ds.priority_2 = 128;
-        state_ref.parent_ds.grandmaster_priority_1 = 15;
-        state_ref.parent_ds.grandmaster_priority_2 = 128;
-
-        drop(state_ref);
-
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         port.set_forced_port_state(PortState::Master);
 
-        let mut actions = port.send_announce(&mut NoForwardedTLVs);
+        let mut actions = port.send_announce(&instance_state, &mut NoForwardedTLVs);
 
         assert!(matches!(
             actions.next(),
@@ -397,7 +400,7 @@ mod tests {
 
         assert_eq!(msg.grandmaster_priority_1, 15);
 
-        let mut actions = port.send_announce(&mut NoForwardedTLVs);
+        let mut actions = port.send_announce(&instance_state, &mut NoForwardedTLVs);
 
         assert!(matches!(
             actions.next(),
@@ -426,20 +429,17 @@ mod tests {
 
     #[test]
     fn test_sync() {
-        let state = setup_test_state();
+        let mut instance_state = setup_test_state();
 
-        let mut state_ref = state.borrow_mut();
-        state_ref.default_ds.priority_1 = 15;
-        state_ref.default_ds.priority_2 = 128;
-        state_ref.parent_ds.grandmaster_priority_1 = 15;
-        state_ref.parent_ds.grandmaster_priority_2 = 128;
+        instance_state.default_ds.priority_1 = 15;
+        instance_state.default_ds.priority_2 = 128;
+        instance_state.parent_ds.grandmaster_priority_1 = 15;
+        instance_state.parent_ds.grandmaster_priority_2 = 128;
 
-        drop(state_ref);
-
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         port.set_forced_port_state(PortState::Master);
-        let mut actions = port.send_sync();
+        let mut actions = port.send_sync(&instance_state);
 
         assert!(matches!(
             actions.next(),
@@ -470,6 +470,7 @@ mod tests {
         };
 
         let mut actions = port.handle_sync_timestamp(
+            &instance_state,
             id,
             Time::from_fixed_nanos(U96F32::from_bits((601300 << 32) + (230 << 16))),
         );
@@ -506,7 +507,7 @@ mod tests {
             TimeInterval(I48F16::from_bits(230))
         );
 
-        let mut actions = port.send_sync();
+        let mut actions = port.send_sync(&instance_state);
 
         assert!(matches!(
             actions.next(),
@@ -537,6 +538,7 @@ mod tests {
         };
 
         let mut actions = port.handle_sync_timestamp(
+            &instance_state,
             id,
             Time::from_fixed_nanos(U96F32::from_bits((1000601300 << 32) + (543 << 16))),
         );
@@ -576,11 +578,12 @@ mod tests {
 
     #[test]
     fn test_peer_delay() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
-        let mut actions = port.handle_pdelay_req(Header::default(), Time::from_micros(500));
+        let mut actions =
+            port.handle_pdelay_req(&instance_state, Header::default(), Time::from_micros(500));
 
         let Some(PortAction::SendEvent {
             context,
@@ -603,7 +606,8 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(550));
+        let mut actions =
+            port.handle_send_timestamp(&instance_state, context, Time::from_micros(550));
 
         let Some(PortAction::SendGeneral {
             data,

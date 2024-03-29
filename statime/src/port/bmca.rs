@@ -17,7 +17,7 @@ use crate::{
     Clock,
 };
 
-impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>, A, R, C, F> {
+impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C, F> {
     pub(super) fn handle_announce<'b>(
         &'b mut self,
         message: &Message<'b>,
@@ -38,13 +38,13 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
 }
 
 // BMCA related functionality of the port
-impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
+impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<InBmca, A, R, C, F> {
     pub(crate) fn calculate_best_local_announce_message(&mut self) {
         self.lifecycle.local_best = self.bmca.take_best_port_announce_message()
     }
 }
 
-impl<'a, A, C: Clock, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
+impl<A, C: Clock, F: Filter, R: Rng> Port<InBmca, A, R, C, F> {
     pub(crate) fn step_announce_age(&mut self, step: Duration) {
         self.bmca.step_age(step);
     }
@@ -257,9 +257,9 @@ mod tests {
 
     #[test]
     fn test_announce_receive() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         let mut announce = default_announce_message();
         announce.header.source_port_identity.clock_identity.0 = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -272,21 +272,21 @@ mod tests {
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
 
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(&instance_state, packet);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(&instance_state, packet);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(&instance_state, packet);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
@@ -300,9 +300,9 @@ mod tests {
 
     #[test]
     fn test_announce_receive_via_event() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port(&state);
+        let mut port = setup_test_port();
 
         let mut announce = default_announce_message();
         announce.header.source_port_identity.clock_identity.0 = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -315,21 +315,21 @@ mod tests {
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(1));
+        let mut actions = port.handle_event_receive(&instance_state, packet, Time::from_micros(1));
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(2));
+        let mut actions = port.handle_event_receive(&instance_state, packet, Time::from_micros(2));
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(3));
+        let mut actions = port.handle_event_receive(&instance_state, packet, Time::from_micros(3));
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };

@@ -3,6 +3,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::{pin, Pin},
+    sync::RwLock,
 };
 
 use clap::Parser;
@@ -254,12 +255,7 @@ async fn actual_main() {
     let time_properties_ds =
         TimePropertiesDS::new_arbitrary_time(false, false, TimeSource::InternalOscillator);
 
-    // Leak to get a static reference, the ptp instance will be around for the rest
-    // of the program anyway
-    let instance = Box::leak(Box::new(PtpInstance::new(
-        instance_config,
-        time_properties_ds,
-    )));
+    let instance = PtpInstance::new(instance_config, time_properties_ds);
 
     // The observer for the metrics exporter
     let (instance_state_sender, instance_state_receiver) =
@@ -270,6 +266,10 @@ async fn actual_main() {
             time_properties_ds: instance.time_properties_ds(),
         });
     statime_linux::observer::spawn(&config, instance_state_receiver).await;
+
+    // Leak to get a static reference, the ptp instance will be around for the rest
+    // of the program anyway
+    let instance: &'static _ = Box::leak(Box::new(RwLock::new(instance)));
 
     let (bmca_notify_sender, bmca_notify_receiver) = tokio::sync::watch::channel(false);
 
@@ -308,7 +308,7 @@ async fn actual_main() {
         };
 
         let rng = StdRng::from_entropy();
-        let port = instance.add_port(
+        let port = instance.write().unwrap().add_port(
             port_config.into(),
             KalmanConfiguration::default(),
             port_clock.clone(),
@@ -333,6 +333,7 @@ async fn actual_main() {
                     open_ipv4_general_socket(interface).expect("Could not open general socket");
 
                 tokio::spawn(port_task(
+                    instance,
                     port_task_receiver,
                     port_task_sender,
                     event_socket,
@@ -349,6 +350,7 @@ async fn actual_main() {
                     open_ipv6_general_socket(interface).expect("Could not open general socket");
 
                 tokio::spawn(port_task(
+                    instance,
                     port_task_receiver,
                     port_task_sender,
                     event_socket,
@@ -363,6 +365,7 @@ async fn actual_main() {
                     open_ethernet_socket(interface, timestamping).expect("Could not open socket");
 
                 tokio::spawn(ethernet_port_task(
+                    instance,
                     port_task_receiver,
                     port_task_sender,
                     interface
@@ -401,7 +404,7 @@ async fn actual_main() {
 }
 
 async fn run(
-    instance: &'static PtpInstance<KalmanFilter>,
+    instance: &'static RwLock<PtpInstance<KalmanFilter>>,
     bmca_notify_sender: tokio::sync::watch::Sender<bool>,
     instance_state_sender: tokio::sync::watch::Sender<ObservableInstanceState>,
     mut main_task_receivers: Vec<Receiver<BmcaPort>>,
@@ -415,7 +418,9 @@ async fn run(
 
     loop {
         // reset bmca timer
-        bmca_timer.as_mut().reset(instance.bmca_interval());
+        bmca_timer
+            .as_mut()
+            .reset(instance.read().unwrap().bmca_interval());
 
         // wait until the next BMCA
         bmca_timer.as_mut().await;
@@ -441,16 +446,19 @@ async fn run(
             mut_bmca_ports.push(mut_bmca_port);
         }
 
-        instance.bmca(&mut mut_bmca_ports);
+        instance.write().unwrap().bmca(&mut mut_bmca_ports);
 
         // Update instance state for observability
         // We don't care if isn't anybody on the other side
-        let _ = instance_state_sender.send(ObservableInstanceState {
-            default_ds: instance.default_ds(),
-            current_ds: instance.current_ds(),
-            parent_ds: instance.parent_ds(),
-            time_properties_ds: instance.time_properties_ds(),
-        });
+        {
+            let instance = instance.read().unwrap();
+            let _ = instance_state_sender.send(ObservableInstanceState {
+                default_ds: instance.default_ds(),
+                current_ds: instance.current_ds(),
+                parent_ds: instance.parent_ds(),
+                time_properties_ds: instance.time_properties_ds(),
+            });
+        }
 
         let mut clock_states = vec![ClockSyncMode::FromSystem; internal_sync_senders.len()];
         for (idx, port) in mut_bmca_ports.iter().enumerate() {
@@ -472,7 +480,7 @@ async fn run(
     }
 }
 
-type BmcaPort = Port<InBmca<'static>, Option<Vec<ClockIdentity>>, StdRng, LinuxClock, KalmanFilter>;
+type BmcaPort = Port<InBmca, Option<Vec<ClockIdentity>>, StdRng, LinuxClock, KalmanFilter>;
 
 // the Port task
 //
@@ -481,6 +489,7 @@ type BmcaPort = Port<InBmca<'static>, Option<Vec<ClockIdentity>>, StdRng, LinuxC
 // the task is notified of a BMCA, it will stop running, move the port into the
 // bmca state, and send it on its Sender
 async fn port_task<A: NetworkAddress + PtpTargetAddress>(
+    instance: &'static RwLock<PtpInstance<KalmanFilter>>,
     mut port_task_receiver: Receiver<BmcaPort>,
     port_task_sender: Sender<BmcaPort>,
     mut event_socket: Socket<A, Open>,
@@ -514,8 +523,10 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
         .await;
 
         while let Some((context, timestamp)) = pending_timestamp {
+            let actions =
+                port.handle_send_timestamp(instance.read().unwrap().state(), context, timestamp);
             pending_timestamp = handle_actions(
-                port.handle_send_timestamp(context, timestamp),
+                actions,
                 &mut event_socket,
                 &mut general_socket,
                 &mut timers,
@@ -537,7 +548,11 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                             // correction when this port uses software timestamping
                             timestamp.seconds += clock.get_tai_offset().expect("Unable to get tai offset") as i64;
                             log::trace!("Recv timestamp: {:?}", packet.timestamp);
-                            port.handle_event_receive(&event_buffer[..packet.bytes_read], timestamp_to_time(timestamp))
+                            port.handle_event_receive(
+                                instance.read().unwrap().state(),
+                                &event_buffer[..packet.bytes_read],
+                                timestamp_to_time(timestamp),
+                            )
                         } else {
                             log::error!("Missing recv timestamp");
                             PortActionIterator::empty()
@@ -546,20 +561,23 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                     Err(error) => panic!("Error receiving: {error:?}"),
                 },
                 result = general_socket.recv(&mut general_buffer) => match result {
-                    Ok(packet) => port.handle_general_receive(&general_buffer[..packet.bytes_read]),
+                    Ok(packet) => port.handle_general_receive(
+                        instance.read().unwrap().state(),
+                        &general_buffer[..packet.bytes_read],
+                    ),
                     Err(error) => panic!("Error receiving: {error:?}"),
                 },
                 () = &mut timers.port_announce_timer => {
-                    port.handle_announce_timer(&mut tlv_forwarder)
+                    port.handle_announce_timer(instance.read().unwrap().state(), &mut tlv_forwarder)
                 },
                 () = &mut timers.port_sync_timer => {
-                    port.handle_sync_timer()
+                    port.handle_sync_timer(instance.read().unwrap().state())
                 },
                 () = &mut timers.port_announce_timeout_timer => {
                     port.handle_announce_receipt_timer()
                 },
                 () = &mut timers.delay_request_timer => {
-                    port.handle_delay_request_timer()
+                    port.handle_delay_request_timer(instance.read().unwrap().state())
                 },
                 () = &mut timers.filter_update_timer => {
                     port.handle_filter_update_timer()
@@ -583,7 +601,11 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
 
                 // there might be more actions to handle based on the current action
                 actions = match pending_timestamp {
-                    Some((context, timestamp)) => port.handle_send_timestamp(context, timestamp),
+                    Some((context, timestamp)) => port.handle_send_timestamp(
+                        instance.read().unwrap().state(),
+                        context,
+                        timestamp,
+                    ),
                     None => break,
                 };
             }
@@ -601,6 +623,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
 // the task is notified of a BMCA, it will stop running, move the port into the
 // bmca state, and send it on its Sender
 async fn ethernet_port_task(
+    instance: &'static RwLock<PtpInstance<KalmanFilter>>,
     mut port_task_receiver: Receiver<BmcaPort>,
     port_task_sender: Sender<BmcaPort>,
     interface: libc::c_int,
@@ -640,8 +663,10 @@ async fn ethernet_port_task(
         .await;
 
         while let Some((context, timestamp)) = pending_timestamp {
+            let actions =
+                port.handle_send_timestamp(instance.read().unwrap().state(), context, timestamp);
             pending_timestamp = handle_actions_ethernet(
-                port.handle_send_timestamp(context, timestamp),
+                actions,
                 interface,
                 &mut socket,
                 &mut timers,
@@ -662,24 +687,31 @@ async fn ethernet_port_task(
                             // correction when this port uses software timestamping
                             timestamp.seconds += clock.get_tai_offset().expect("Unable to get tai offset") as i64;
                             log::trace!("Recv timestamp: {:?}", packet.timestamp);
-                            port.handle_event_receive(&event_buffer[..packet.bytes_read], timestamp_to_time(timestamp))
+                            port.handle_event_receive(
+                                instance.read().unwrap().state(),
+                                &event_buffer[..packet.bytes_read],
+                                timestamp_to_time(timestamp),
+                            )
                         } else {
-                            port.handle_general_receive(&event_buffer[..packet.bytes_read])
+                            port.handle_general_receive(
+                                instance.read().unwrap().state(),
+                                &event_buffer[..packet.bytes_read],
+                            )
                         }
                     }
                     Err(error) => panic!("Error receiving: {error:?}"),
                 },
                 () = &mut timers.port_announce_timer => {
-                    port.handle_announce_timer(&mut tlv_forwarder)
+                    port.handle_announce_timer(instance.read().unwrap().state(), &mut tlv_forwarder)
                 },
                 () = &mut timers.port_sync_timer => {
-                    port.handle_sync_timer()
+                    port.handle_sync_timer(instance.read().unwrap().state())
                 },
                 () = &mut timers.port_announce_timeout_timer => {
                     port.handle_announce_receipt_timer()
                 },
                 () = &mut timers.delay_request_timer => {
-                    port.handle_delay_request_timer()
+                    port.handle_delay_request_timer(instance.read().unwrap().state())
                 },
                 () = &mut timers.filter_update_timer => {
                     port.handle_filter_update_timer()
@@ -703,7 +735,11 @@ async fn ethernet_port_task(
 
                 // there might be more actions to handle based on the current action
                 actions = match pending_timestamp {
-                    Some((context, timestamp)) => port.handle_send_timestamp(context, timestamp),
+                    Some((context, timestamp)) => port.handle_send_timestamp(
+                        instance.read().unwrap().state(),
+                        context,
+                        timestamp,
+                    ),
                     None => break,
                 };
             }

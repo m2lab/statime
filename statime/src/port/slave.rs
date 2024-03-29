@@ -12,11 +12,12 @@ use crate::{
     },
     filters::Filter,
     port::{actions::TimestampContextInner, state::SyncState, PortAction, TimestampContext},
+    ptp_instance::PtpInstanceState,
     time::{Duration, Interval, Time},
     Clock,
 };
 
-impl<'a, A, C: Clock, F: Filter, R> Port<Running<'a>, A, R, C, F> {
+impl<A, C: Clock, F: Filter, R> Port<Running, A, R, C, F> {
     pub(super) fn handle_time_measurement<'b>(&mut self) -> PortActionIterator<'b> {
         if let Some(measurement) = self.extract_measurement() {
             // If the received message allowed the (slave) state to calculate its offset
@@ -447,25 +448,23 @@ impl<'a, A, C: Clock, F: Filter, R> Port<Running<'a>, A, R, C, F> {
     }
 }
 
-impl<'a, A, C: Clock, F: Filter, R: Rng> Port<Running<'a>, A, R, C, F> {
-    pub(super) fn send_delay_request(&mut self) -> PortActionIterator {
+impl<A, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C, F> {
+    pub(super) fn send_delay_request(&mut self, state: &PtpInstanceState) -> PortActionIterator {
         match self.config.delay_mechanism {
-            DelayMechanism::E2E { interval } => self.send_e2e_delay_request(interval),
-            DelayMechanism::P2P { interval } => self.send_p2p_delay_request(interval),
+            DelayMechanism::E2E { interval } => self.send_e2e_delay_request(state, interval),
+            DelayMechanism::P2P { interval } => self.send_p2p_delay_request(state, interval),
         }
     }
 
     fn send_p2p_delay_request(
         &mut self,
+        instance_state: &PtpInstanceState,
         log_min_pdelay_req_interval: Interval,
     ) -> PortActionIterator {
         let pdelay_id = self.pdelay_seq_ids.generate();
 
-        let pdelay_req = Message::pdelay_req(
-            &self.lifecycle.state.default_ds,
-            self.port_identity,
-            pdelay_id,
-        );
+        let pdelay_req =
+            Message::pdelay_req(&instance_state.default_ds, self.port_identity, pdelay_id);
         let message_length = match pdelay_req.serialize(&mut self.packet_buffer) {
             Ok(length) => length,
             Err(error) => {
@@ -503,6 +502,7 @@ impl<'a, A, C: Clock, F: Filter, R: Rng> Port<Running<'a>, A, R, C, F> {
 
     fn send_e2e_delay_request(
         &mut self,
+        instance_state: &PtpInstanceState,
         log_min_delay_req_interval: Interval,
     ) -> PortActionIterator {
         match self.port_state {
@@ -510,11 +510,8 @@ impl<'a, A, C: Clock, F: Filter, R: Rng> Port<Running<'a>, A, R, C, F> {
                 log::debug!("Starting new delay measurement");
 
                 let delay_id = self.delay_seq_ids.generate();
-                let delay_req = Message::delay_req(
-                    &self.lifecycle.state.default_ds,
-                    self.port_identity,
-                    delay_id,
-                );
+                let delay_req =
+                    Message::delay_req(&instance_state.default_ds, self.port_identity, delay_id);
 
                 let message_length = match delay_req.serialize(&mut self.packet_buffer) {
                     Ok(length) => length,
@@ -606,9 +603,7 @@ mod tests {
 
     #[test]
     fn test_sync_without_delay_msg() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         let state = SlaveState::new(Default::default());
         port.mean_delay = Some(Duration::from_micros(100));
@@ -686,9 +681,7 @@ mod tests {
 
     #[test]
     fn test_delay_asymmetry() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         port.config.delay_asymmetry = Duration::from_micros(100);
 
@@ -726,9 +719,9 @@ mod tests {
 
     #[test]
     fn test_sync_with_delay() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         let state = SlaveState::new(Default::default());
 
@@ -760,7 +753,7 @@ mod tests {
             })
         );
 
-        let mut action = port.send_delay_request();
+        let mut action = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = action.next() else {
             panic!("Unexpected action");
@@ -843,7 +836,7 @@ mod tests {
         drop(action);
         assert_eq!(port.filter.last_measurement.take(), None);
 
-        let mut action = port.send_delay_request();
+        let mut action = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = action.next() else {
             panic!("Unexpected action");
@@ -935,9 +928,7 @@ mod tests {
 
     #[test]
     fn test_follow_up_before_sync() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         let state = SlaveState::new(Default::default());
         port.mean_delay = Some(Duration::from_micros(100));
@@ -990,9 +981,7 @@ mod tests {
 
     #[test]
     fn test_old_followup_during() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         let state = SlaveState::new(Default::default());
         port.mean_delay = Some(Duration::from_micros(100));
@@ -1051,9 +1040,7 @@ mod tests {
 
     #[test]
     fn test_reset_after_missing_followup() {
-        let state = setup_test_state();
-
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         let state = SlaveState::new(Default::default());
         port.mean_delay = Some(Duration::from_micros(100));
@@ -1123,9 +1110,9 @@ mod tests {
 
     #[test]
     fn test_ignore_unrelated_delayresp() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
 
         let state = SlaveState::new(Default::default());
 
@@ -1158,7 +1145,7 @@ mod tests {
             })
         );
 
-        let mut action = port.send_delay_request();
+        let mut action = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = action.next() else {
             panic!("Unexpected action");
@@ -1263,9 +1250,9 @@ mod tests {
 
     #[test]
     fn test_peer_delay_1step() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
         port.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
@@ -1274,7 +1261,7 @@ mod tests {
 
         port.set_forced_port_state(PortState::Slave(state));
 
-        let mut actions = port.send_delay_request();
+        let mut actions = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
@@ -1292,7 +1279,8 @@ mod tests {
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
+        let mut actions =
+            port.handle_send_timestamp(&instance_state, context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
@@ -1328,9 +1316,9 @@ mod tests {
 
     #[test]
     fn test_peer_delay_2step() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
         port.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
@@ -1339,7 +1327,7 @@ mod tests {
 
         port.set_forced_port_state(PortState::Slave(state));
 
-        let mut actions = port.send_delay_request();
+        let mut actions = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
@@ -1357,7 +1345,8 @@ mod tests {
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
+        let mut actions =
+            port.handle_send_timestamp(&instance_state, context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
@@ -1410,9 +1399,9 @@ mod tests {
 
     #[test]
     fn test_peer_delay_2step_followup_before_response() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
         port.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
@@ -1421,7 +1410,7 @@ mod tests {
 
         port.set_forced_port_state(PortState::Slave(state));
 
-        let mut actions = port.send_delay_request();
+        let mut actions = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
@@ -1439,7 +1428,8 @@ mod tests {
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
+        let mut actions =
+            port.handle_send_timestamp(&instance_state, context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
@@ -1493,9 +1483,9 @@ mod tests {
 
     #[test]
     fn test_peer_delay_faulty() {
-        let state = setup_test_state();
+        let instance_state = setup_test_state();
 
-        let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
+        let mut port = setup_test_port_custom_filter::<TestFilter>(());
         port.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
@@ -1504,7 +1494,7 @@ mod tests {
 
         port.set_forced_port_state(PortState::Slave(state));
 
-        let mut actions = port.send_delay_request();
+        let mut actions = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
@@ -1522,7 +1512,8 @@ mod tests {
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
+        let mut actions =
+            port.handle_send_timestamp(&instance_state, context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
@@ -1577,7 +1568,7 @@ mod tests {
         assert!(port.filter.last_measurement.take().is_none());
         assert!(matches!(port.port_state, PortState::Faulty));
 
-        let mut actions = port.send_delay_request();
+        let mut actions = port.send_delay_request(&instance_state);
 
         let Some(PortAction::ResetDelayRequestTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
@@ -1595,7 +1586,8 @@ mod tests {
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
 
-        let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
+        let mut actions =
+            port.handle_send_timestamp(&instance_state, context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
         assert!(port.filter.last_measurement.take().is_none());
