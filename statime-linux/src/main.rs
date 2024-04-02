@@ -549,7 +549,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                             timestamp.seconds += clock.get_tai_offset().expect("Unable to get tai offset") as i64;
                             log::trace!("Recv timestamp: {:?}", packet.timestamp);
                             port.handle_event_receive(
-                                instance.read().unwrap().state(),
+                                instance.write().unwrap().state_mut(),
                                 &event_buffer[..packet.bytes_read],
                                 timestamp_to_time(timestamp),
                             )
@@ -562,7 +562,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                 },
                 result = general_socket.recv(&mut general_buffer) => match result {
                     Ok(packet) => port.handle_general_receive(
-                        instance.read().unwrap().state(),
+                        instance.write().unwrap().state_mut(),
                         &general_buffer[..packet.bytes_read],
                     ),
                     Err(error) => panic!("Error receiving: {error:?}"),
@@ -688,13 +688,13 @@ async fn ethernet_port_task(
                             timestamp.seconds += clock.get_tai_offset().expect("Unable to get tai offset") as i64;
                             log::trace!("Recv timestamp: {:?}", packet.timestamp);
                             port.handle_event_receive(
-                                instance.read().unwrap().state(),
+                                instance.write().unwrap().state_mut(),
                                 &event_buffer[..packet.bytes_read],
                                 timestamp_to_time(timestamp),
                             )
                         } else {
                             port.handle_general_receive(
-                                instance.read().unwrap().state(),
+                                instance.write().unwrap().state_mut(),
                                 &event_buffer[..packet.bytes_read],
                             )
                         }

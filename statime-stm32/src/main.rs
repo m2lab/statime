@@ -457,13 +457,13 @@ mod app {
             (&mut *instance, &mut *port).lock(|instance, port| {
                 if IS_EVENT {
                     port.handle_event_receive(
-                        instance.state(),
+                        instance.state_mut(),
                         data,
                         stm_time_to_statime(timestamp),
                         net,
                     );
                 } else {
-                    port.handle_general_receive(instance.state(), data, net);
+                    port.handle_general_receive(instance.state_mut(), data, net);
                 };
             });
         }

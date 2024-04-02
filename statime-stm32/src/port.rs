@@ -52,7 +52,7 @@ impl Port {
 
     pub fn handle_event_receive(
         &mut self,
-        instance_state: &PtpInstanceState,
+        instance_state: &mut PtpInstanceState,
         data: &[u8],
         timestamp: Time,
         net: &mut impl Mutex<T = NetworkStack>,
@@ -65,7 +65,7 @@ impl Port {
 
     pub fn handle_general_receive(
         &mut self,
-        instance_state: &PtpInstanceState,
+        instance_state: &mut PtpInstanceState,
         data: &[u8],
         net: &mut impl Mutex<T = NetworkStack>,
     ) {

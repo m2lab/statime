@@ -461,7 +461,7 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C
     /// Handle a message over the event channel
     pub fn handle_event_receive<'b>(
         &'b mut self,
-        instance_state: &PtpInstanceState,
+        instance_state: &mut PtpInstanceState,
         data: &'b [u8],
         timestamp: Time,
     ) -> PortActionIterator<'b> {
@@ -481,14 +481,14 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C
             MessageBody::PDelayResp(peer_delay_response) => {
                 self.handle_peer_delay_response(message.header, peer_delay_response, timestamp)
             }
-            _ => self.handle_general_internal(message),
+            _ => self.handle_general_internal(instance_state, message),
         }
     }
 
     /// Handle a general ptp message
     pub fn handle_general_receive<'b>(
         &'b mut self,
-        instance_state: &PtpInstanceState,
+        instance_state: &mut PtpInstanceState,
         data: &'b [u8],
     ) -> PortActionIterator<'b> {
         let message = match self.parse_and_filter(instance_state, data) {
@@ -496,12 +496,18 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C
             ControlFlow::Break(value) => return value,
         };
 
-        self.handle_general_internal(message)
+        self.handle_general_internal(instance_state, message)
     }
 
-    fn handle_general_internal<'b>(&'b mut self, message: Message<'b>) -> PortActionIterator<'b> {
+    fn handle_general_internal<'b>(
+        &'b mut self,
+        instance_state: &mut PtpInstanceState,
+        message: Message<'b>,
+    ) -> PortActionIterator<'b> {
         match message.body {
-            MessageBody::Announce(announce) => self.handle_announce(&message, announce),
+            MessageBody::Announce(announce) => {
+                self.handle_announce(instance_state, &message, announce)
+            }
             MessageBody::FollowUp(follow_up) => self.handle_follow_up(message.header, follow_up),
             MessageBody::DelayResp(delay_response) => {
                 self.handle_delay_resp(message.header, delay_response)
