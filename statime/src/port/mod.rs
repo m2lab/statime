@@ -482,7 +482,7 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C
             MessageBody::PDelayResp(peer_delay_response) => {
                 self.handle_peer_delay_response(message.header, peer_delay_response, timestamp)
             }
-            _ => self.handle_general_internal(message),
+            _ => self.handle_general_internal(&mut ptp_instance, message),
         }
     }
 
@@ -497,12 +497,18 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running, A, R, C
             ControlFlow::Break(value) => return value,
         };
 
-        self.handle_general_internal(message)
+        self.handle_general_internal(&mut ptp_instance, message)
     }
 
-    fn handle_general_internal<'b>(&'b mut self, message: Message<'b>) -> PortActionIterator<'b> {
+    fn handle_general_internal<'b>(
+        &'b mut self,
+        ptp_instance: impl LockablePtpInstance<Filter = F>,
+        message: Message<'b>,
+    ) -> PortActionIterator<'b> {
         match message.body {
-            MessageBody::Announce(announce) => self.handle_announce(&message, announce),
+            MessageBody::Announce(announce) => {
+                self.handle_announce(ptp_instance, &message, announce)
+            }
             MessageBody::FollowUp(follow_up) => self.handle_follow_up(message.header, follow_up),
             MessageBody::DelayResp(delay_response) => {
                 self.handle_delay_resp(message.header, delay_response)
